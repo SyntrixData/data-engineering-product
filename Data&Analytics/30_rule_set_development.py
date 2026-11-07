@@ -258,7 +258,7 @@ def _bin_stats(df: DataFrame, group_expr, target: str) -> List[Dict[str, Any]]:
 
 
 def generate_candidate_rules(
-    df: DataFrame, config: Dict[str, Any] = CONFIG
+    df: DataFrame, target_column: str, config: Dict[str, Any] = CONFIG
 ) -> List[Dict[str, Any]]:
     """STEP 2a: profile every feature and emit candidate rules.
 
@@ -268,7 +268,7 @@ def generate_candidate_rules(
     high-lift value and one combined IN (...) rule for all high-lift
     values together. Every candidate carries its profiling stats.
     """
-    target = config["target_column"]
+    target = target_column
     candidates: List[Dict[str, Any]] = []
 
     for feature in config["feature_columns"]:
@@ -377,7 +377,7 @@ def evaluate_candidates(
 
 
 def greedy_rule_selection(
-    train: DataFrame, candidates: List[Dict[str, Any]],
+    train: DataFrame, candidates: List[Dict[str, Any]], target_column: str,
     config: Dict[str, Any] = CONFIG,
 ) -> List[Dict[str, Any]]:
     """STEP 2b: greedily build the rule set under the FPR budget.
@@ -390,7 +390,7 @@ def greedy_rule_selection(
     false positives - the direct implementation of 'accurate with
     minimal false positives'.
     """
-    target = config["target_column"]
+    target = target_column
     totals = train.agg(
         F.sum(when(col(target) == 1, 1).otherwise(0)).alias("pos"),
         F.sum(when(col(target) == 0, 1).otherwise(0)).alias("neg"),
@@ -443,7 +443,8 @@ def greedy_rule_selection(
 
 
 def train_ml_benchmark(
-    train: DataFrame, test: DataFrame, config: Dict[str, Any] = CONFIG
+    train: DataFrame, test: DataFrame, target_column: str,
+    config: Dict[str, Any] = CONFIG
 ) -> Dict[str, float]:
     """ML benchmark: gradient-boosted trees as the accuracy 'ceiling'.
 
@@ -457,7 +458,7 @@ def train_ml_benchmark(
     from pyspark.ml.feature import (StringIndexer, OneHotEncoder,
                                     VectorAssembler)
 
-    target = config["target_column"]
+    target = target_column
     stages, feature_cols = [], []
     for f in config["feature_columns"]:
         if f in config["categorical_columns"]:
@@ -483,16 +484,21 @@ def train_ml_benchmark(
 
 
 def develop_rule_set(
-    df: DataFrame, config: Dict[str, Any] = CONFIG
+    df: DataFrame, target_column: str, config: Dict[str, Any] = CONFIG
 ) -> Dict[str, Any]:
-    """STEP 2 orchestrator: split, profile, mine, select, benchmark."""
+    """STEP 2 orchestrator: split, profile, mine, select, benchmark.
+
+    target_column is an explicit REQUIRED input - the binary 0/1 column
+    the rule set must learn to identify - and is threaded through every
+    stage below rather than read from global config.
+    """
     train, test = df.randomSplit(
         [config["train_fraction"], 1 - config["train_fraction"]],
         seed=config["seed"])
     train = train.cache()
-    candidates = generate_candidate_rules(train, config)
-    rules = greedy_rule_selection(train, candidates, config)
-    benchmark = train_ml_benchmark(train, test, config)
+    candidates = generate_candidate_rules(train, target_column, config)
+    rules = greedy_rule_selection(train, candidates, target_column, config)
+    benchmark = train_ml_benchmark(train, test, target_column, config)
     print(f"[STEP 2] rule set developed: {len(rules)} rules; "
           f"ML benchmark AUC-ROC {benchmark['ml_auc_roc']:.3f}")
     return {"rules": rules, "benchmark": benchmark, "train": train,
@@ -512,7 +518,7 @@ def apply_rule_set(df: DataFrame, rules: List[Dict[str, Any]],
 
 
 def evaluate_rule_set(
-    df: DataFrame, rules: List[Dict[str, Any]],
+    df: DataFrame, rules: List[Dict[str, Any]], target_column: str,
     config: Dict[str, Any] = CONFIG,
     benchmark: Optional[Dict[str, float]] = None,
     label: str = "test",
@@ -522,7 +528,7 @@ def evaluate_rule_set(
     Evaluated on the held-out TEST split by default - measuring on the
     data the rules were mined from would flatter every number below.
     """
-    target = config["target_column"]
+    target = target_column
     scored = apply_rule_set(df, rules)
     row = scored.agg(
         F.sum(when((col("rule_prediction") == 1) & (col(target) == 1), 1)
@@ -575,12 +581,17 @@ def main() -> None:
         df = load_dataset(spark)                      # STEP 1
     df = df.cache()
 
-    developed = develop_rule_set(df)                  # STEP 2
+    # The target column is stated explicitly here and passed down the
+    # whole pipeline - it is an input to the analysis, not a global.
+    target_column = CONFIG["target_column"]
+    developed = develop_rule_set(df, target_column)   # STEP 2
     report = evaluate_rule_set(developed["test"], developed["rules"],
+                               target_column,
                                benchmark=developed["benchmark"],
                                label="test (held-out)")   # STEP 3
     # Also show the train numbers so overfitting is visible, not hidden.
-    evaluate_rule_set(developed["train"], developed["rules"], label="train")
+    evaluate_rule_set(developed["train"], developed["rules"],
+                      target_column, label="train")
 
     print("\nFINAL RULE SET (predict target=1 if ANY rule fires):")
     for i, cond in enumerate(report["rules"], 1):
